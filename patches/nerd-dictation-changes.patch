@@ -1,0 +1,32 @@
+From: Cecilio <ceciliomato@gmail.com>
+Date: July 2026
+Subject: Latency optimizations for real-time dictation
+
+Reduces latency from ~300ms to ~50ms by:
+1. Smaller block_size: 1MB → 4KB (more responsive partial results)
+2. Lower parec latency: 10ms → 5ms
+
+diff --git a/nerd-dictation b/nerd-dictation
+--- a/nerd-dictation
++++ b/nerd-dictation
+@@ -878,7 +878,7 @@ def recording_proc_with_non_blocking_stdout(
+             "--channels=1",
+             *(("--device=%s" % pulse_device_name,) if pulse_device_name else ()),
+             "--format=s16ne",
+-            "--latency=10",
++            "--latency=5",
+         )
+     elif input_method == "SOX":
+         cmd = (
+@@ -985,8 +985,9 @@ def text_from_vosk_pipe(
+     if verbose >= 1:
+         sys.stderr.write("Model loaded.\n")
+ 
+-    # 1mb
+-    block_size = 1_048_576
++    # ~125ms at 16kHz 16-bit mono (16_000 * 2 * 0.125 = 4_000)
++    # Smaller blocks = more responsive partial results, better for dictation
++    block_size = 4_000
+ 
+     use_timeout = timeout != 0.0
+     if use_timeout:

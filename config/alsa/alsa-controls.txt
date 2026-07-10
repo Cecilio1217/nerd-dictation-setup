@@ -1,0 +1,19 @@
+# ALSA DMIC gains para Intel Tiger Lake-LP
+# Ajustes manuales con amixer - estos valores evitan saturación del DMIC.
+# Si se reinstala el sistema, ejecutar:
+#
+#   amixer -c 0 cset numid=41 35   # Dmic0 Capture Volume  (default 70 → +20dB, saturado)
+#   amixer -c 0 cset numid=44 35   # Dmic1 Capture Volume
+#   amixer -c 0 cset numid=8 1     # Mic Boost             (default 3 → 30dB, saturado → 10dB)
+#   amixer -c 0 cset numid=6 45    # Capture Volume         (default 63 → 45)
+#
+# Para verificar niveles en tiempo real:
+#   alsamixer -c 0 -V capture
+#
+# Para persistir los cambios entre reinicios:
+#   sudo alsactl store
+#   sudo alsactl restore  # en el nuevo sistema
+#
+# Los numid pueden variar según kernel/BIOS. Verificar con:
+#   amixer -c 0 controls | grep -i dmic
+#   amixer -c 0 cget numid=41

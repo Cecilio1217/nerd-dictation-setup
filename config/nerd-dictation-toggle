@@ -1,0 +1,30 @@
+#!/bin/bash
+# nerd-dictation-toggle - Resume/Suspend dictado (daemon siempre activo)
+# Atajo recomendado: Ctrl+Shift+Space (no conflictúa con mute de mic)
+#
+# Instalación: copiar a ~/.local/bin/ y dar permiso +x
+#   cp nerd-dictation-toggle ~/.local/bin/
+#   chmod +x ~/.local/bin/nerd-dictation-toggle
+#
+# Luego asignar la hotkey desde Preferencias del Sistema → Atajos → Atajos personalizados
+
+COOKIE="/tmp/nerd-dictation-cookie"
+STATE_FILE="/tmp/nerd-dictation-state"
+NERD="$HOME/nerd-dictation/nerd-dictation"
+
+if [ ! -f "$COOKIE" ] || ! kill -0 $(cat "$COOKIE") 2>/dev/null; then
+    notify-send -t 3000 -u critical "❌ nerd-dictation no está corriendo"
+    exit 1
+fi
+
+if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "listening" ]; then
+    # Está escuchando → suspender
+    $NERD suspend --cookie "$COOKIE"
+    echo "suspended" > "$STATE_FILE"
+    notify-send -t 2000 "🎤 Dictado suspendido" "Hotkey para reanudar"
+else
+    # Está suspendido → reanudar
+    $NERD resume --cookie "$COOKIE"
+    echo "listening" > "$STATE_FILE"
+    notify-send -t 2000 "🎤 Dictado activo" "Hablá al micrófono"
+fi
