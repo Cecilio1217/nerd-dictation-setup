@@ -1,17 +1,37 @@
 From: Cecilio <ceciliomato@gmail.com>
 Date: July 2026
-Subject: Latency optimizations + space between words fix for real-time dictation
+Subject: Nerd-dictation patches for real-time dictation in Spanish
 
 Changes:
-1. Smaller block_size: 1MB -> 4KB (more responsive partial results)
-2. Lower parec latency: 10ms -> 5ms
-3. Space between words: after a pause (final result reset), prepend a space
-   so the next utterance doesn't get joined to the previous word.
+1. Block size: 1MB -> 4KB (= 125ms @ 16kHz) for responsive partial results
+2. Parec latency: 10ms -> 5ms for lower audio pipeline delay
+3. Space between words after pause: when text_prev is reset after a final result,
+   prepend a space to the next utterance. The artificial space is NOT stored in
+   text_prev so subsequent partial comparisons don't backspace it.
+4. Spanish word merging fix: regex that splits short function words (de, con, el,
+   la, los, las, en, por, para, que, al, un, una, entre, sobre, hasta, sin, se,
+   no, su) from the preceding word when they get merged by VOSK's small model.
+5. Debug logging: verbose >= 2 prints raw VOSK output to stderr for debugging.
 
 diff --git a/nerd-dictation b/nerd-dictation
+index aaf2129..18851a0 100755
 --- a/nerd-dictation
 +++ b/nerd-dictation
-@@ -878,7 +878,7 @@ def recording_proc_with_non_blocking_stdout(
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python3
++#!/usr/bin/env python3
+ # SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ """
+@@ -11,6 +11,7 @@ While it could use any system currently it uses the VOSK-API.
+ # All built in modules.
+ import argparse
+ import os
++import re
+ import stat
+ import subprocess
+ import sys
+@@ -878,7 +879,7 @@ def recording_proc_with_non_blocking_stdout(
              "--channels=1",
              *(("--device=%s" % pulse_device_name,) if pulse_device_name else ()),
              "--format=s16ne",
@@ -20,7 +40,7 @@ diff --git a/nerd-dictation b/nerd-dictation
          )
      elif input_method == "SOX":
          cmd = (
-@@ -985,8 +985,9 @@ def text_from_vosk_pipe(
+@@ -985,8 +986,9 @@ def text_from_vosk_pipe(
      if verbose >= 1:
          sys.stderr.write("Model loaded.\n")
  
@@ -32,16 +52,79 @@ diff --git a/nerd-dictation b/nerd-dictation
  
      use_timeout = timeout != 0.0
      if use_timeout:
-@@ -1039,6 +1039,12 @@ def text_from_vosk_pipe(
+@@ -1039,6 +1041,16 @@ def text_from_vosk_pipe(
          else:
              text_curr = process_fn(" ".join(text_list + [text]))
  
 +        # When text_prev was reset to "" after a final result (due to a pause),
 +        # prepend a space so the next word doesn't get joined to the previous one.
 +        # Don't add space on the very first utterance (handled_any == False).
++        # IMPORTANT: we must NOT save the artificial space in text_prev,
++        # otherwise the NEXT partial result's comparison backspaces it.
++        _space_fix_applied = False
 +        if text_prev == "" and text_curr and handled_any:
 +            text_curr = " " + text_curr
++            _space_fix_applied = True
 +
          if text_curr != text_prev:
              match = min(len(text_curr), len(text_prev))
              for i in range(min(len(text_curr), len(text_prev))):
+@@ -1049,7 +1061,9 @@ def text_from_vosk_pipe(
+             # Emit text, deleting any previous incorrectly transcribed output
+             handle_fn(len(text_prev) - match, text_curr[match:])
+ 
+-            text_prev = text_curr
++            # Strip the artificial space from text_prev so subsequent
++            # partial comparisons don't backspace the space we just typed.
++            text_prev = text_curr[1:] if _space_fix_applied else text_curr
+ 
+         if not is_partial_arg:
+             if progressive_continuous:
+@@ -1364,6 +1378,25 @@ def main_begin(
+ 
+     process_fn_is_first = True
+ 
++    # Regex to fix VOSK Spanish model merging short function words
++    # with the preceding word. The preceding word must end in a vowel
++    # (or n/r/s/d/l/z — common Spanish word‑final consonants) to avoid
++    # splitting valid longer words like "silla" or "ella".
++    _VOSK_ES_MERGE_RE = re.compile(
++        r"""
++        ([a-záéíóúñ]{2,}[aeiouáéíóúnrsdlz]) # preceding word ending in vowel or common consonant
++        (de|del|el|la|los|las|con|en|        # short function words VOSK tends to merge
++         por|para|que|al|un|una|
++         entre|sobre|hasta|sin|se|no|su)
++        (?![a-záéíóúñ])                       # not followed by more letters
++        """,
++        re.IGNORECASE | re.VERBOSE,
++    )
++
++    def _fix_spanish_merged(text: str) -> str:
++        """Post-process VOSK output: insert spaces between merged Spanish words."""
++        return _VOSK_ES_MERGE_RE.sub(r"\1 \2", text)
++
+     def process_fn(text: str) -> str:
+         nonlocal user_config
+         nonlocal process_fn_is_first
+@@ -1379,6 +1412,9 @@ def main_begin(
+         if not text:
+             return ""
+ 
++        if verbose >= 2:
++            sys.stderr.write("[nerd-dictation] VOSK raw: %r\n" % text)
++
+         #
+         # Simple text post processing and capitalization.
+         #
+@@ -1397,6 +1433,11 @@ def main_begin(
+         if user_config is not None:
+             text = process_text_with_user_config(user_config, text)
+ 
++        #
++        # Fix VOSK Spanish word-merging
++        #
++        text = _fix_spanish_merged(text)
++
+         if is_run_on:
+             # This is a signal that the end of the sentence has been reached.
+             if full_sentence:

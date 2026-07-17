@@ -194,7 +194,9 @@ cmd_help() {
     echo ""
     echo "Configuración:"
     echo "  model [small|large|list]  Ver/cambiar modelo VOSK"
-    echo "  menu                 Menú interactivo"
+    echo ""
+    echo "Interfaz:"
+    echo "  menu                 Panel con checklist (↑↓·Espacio·↵)"
     echo "  logs [-f]            Ver logs del servicio"
     echo "  help                 Esta ayuda"
 }
@@ -208,41 +210,50 @@ cmd_menu() {
         fi
     done
     if [ -z "$dialog_cmd" ]; then
-        error "No se encontró dialog ni whiptail. Instalá: sudo apt install dialog"
+        error "Se necesita 'dialog'. Instalá: sudo apt install dialog"
         exit 1
     fi
 
-    while true; do
-        local opt
-        opt=$("$dialog_cmd" --clear --title "ndctl — nerd-dictation" \
-            --menu "Elegí una opción:" 18 55 10 \
-            "status"  "Estado del servicio" \
-            "start"   "Iniciar servicio" \
-            "stop"    "Detener servicio" \
-            "restart" "Reiniciar servicio" \
-            "toggle"  "Pausar/reanudar dictado" \
-            "suspend" "Suspender dictado" \
-            "resume"  "Reanudar dictado" \
-            "model"   "Cambiar modelo VOSK" \
-            "logs"    "Ver logs" \
-            "exit"    "Salir" \
-            3>&1 1>&2 2>&3)
-        [ -z "$opt" ] && break
-        case "$opt" in
-            status)  cmd_status ;;
-            start)   cmd_start ;;
-            stop)    cmd_stop ;;
-            restart) cmd_restart ;;
-            toggle)  cmd_toggle ;;
-            suspend) cmd_suspend ;;
-            resume)  cmd_resume ;;
-            model)   cmd_model list; echo "Para cambiar: ndctl model small|large" ;;
-            logs)    cmd_logs -n 20 ;;
-            exit)    break ;;
-        esac
-        echo ""
-        read -n 1 -s -r -p "Presioná cualquier tecla para continuar..."
-    done
+    # ── leer estado actual ──────────────────────────────
+    local svc_on="off";  service_active && svc_on="on"
+    local dict_on="off"
+    if daemon_running; then
+        if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "suspended" ]; then
+            dict_on="off"
+        else
+            dict_on="on"
+        fi
+    fi
+
+    local choices
+    choices=$("$dialog_cmd" --stdout --title "ndctl — nerd-dictation" \
+        --checklist "↑↓ navegar · Espacio marcar/desmarcar · Enter aplicar" 14 62 4 \
+        "svc"   "Servicio (iniciar/detener)"                        "$svc_on" \
+        "dict"  "Dictado activo (pausar/reanudar)"                  "$dict_on" \
+    )
+
+    local rc=$?
+    [ $rc -ne 0 ] && return  # Cancel / ESC
+
+    # ── comparar estado deseado vs actual y aplicar ──────
+    local svc_wanted="off"; echo "$choices" | grep -q "svc"  && svc_wanted="on"
+    local dict_wanted="off"; echo "$choices" | grep -q "dict" && dict_wanted="on"
+
+    if [ "$svc_wanted" != "$svc_on" ]; then
+        if [ "$svc_wanted" = "on" ]; then
+            cmd_start
+        else
+            cmd_stop
+        fi
+    fi
+
+    if [ "$dict_wanted" != "$dict_on" ]; then
+        if [ "$dict_wanted" = "on" ]; then
+            cmd_resume
+        else
+            cmd_suspend
+        fi
+    fi
 }
 
 # ─── dispatch ───────────────────────────────────────────────
