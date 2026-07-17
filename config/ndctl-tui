@@ -20,6 +20,7 @@ import shutil
 from pathlib import Path
 
 SERVICE = "nerd-dictation.service"
+CANARY_SERVICE = "stt-canary.service"
 SERVICE_FILE = Path.home() / ".config" / "systemd" / "user" / SERVICE
 COOKIE = Path("/tmp/nerd-dictation-cookie")
 STATE_FILE = Path("/tmp/nerd-dictation-state")
@@ -43,9 +44,11 @@ def _systemctl(*args):
 
 
 def service_active() -> bool:
+    """Check if the currently active transcription service is running."""
     try:
+        svc = CANARY_SERVICE if current_model() == "canary" else SERVICE
         out = subprocess.check_output(
-            ["systemctl", "--user", "is-active", SERVICE], stderr=subprocess.DEVNULL
+            ["systemctl", "--user", "is-active", svc], stderr=subprocess.DEVNULL
         ).decode().strip()
         return out == "active"
     except Exception:
@@ -53,6 +56,8 @@ def service_active() -> bool:
 
 
 def service_enabled() -> bool:
+    """Check if nerd-dictation (VOSK) is enabled at login."""
+    # Only applies to VOSK, canary has its own enable/disable
     try:
         out = subprocess.check_output(
             ["systemctl", "--user", "is-enabled", SERVICE], stderr=subprocess.DEVNULL
@@ -104,18 +109,26 @@ def has_config_flag() -> bool:
 # ─── Actions ──────────────────────────────────────────────
 
 def start_service():
-    _systemctl("start", SERVICE)
+    """Start the active transcription service."""
+    if current_model() == "canary":
+        _systemctl("start", CANARY_SERVICE)
+    else:
+        _systemctl("start", SERVICE)
 
 
 def stop_service():
+    """Stop the active transcription service."""
     _systemctl("stop", SERVICE)
+    _systemctl("stop", CANARY_SERVICE)
 
 
 def restart_service():
-    _systemctl("restart", SERVICE)
-    # Wait briefly then update state
+    """Restart the active transcription service."""
+    stop_service()
     import time
-    time.sleep(1)
+    time.sleep(0.5)
+    start_service()
+    time.sleep(0.5)
 
 
 def enable_service():
@@ -226,13 +239,55 @@ def switch_model() -> str:
 
 
 def current_model() -> str:
-    """Detect current VOSK model from the service file."""
+    """Detect current transcription engine: small, large, or canary."""
     if not SERVICE_FILE.exists():
         return "small"
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "is-active", CANARY_SERVICE],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        if out == "active":
+            return "canary"
+    except Exception:
+        pass
     content = SERVICE_FILE.read_text()
     if "vosk-model-es-0.42" in content:
         return "large"
     return "small"
+
+
+def switch_model() -> str:
+    """Switch between small, large, and canary. Returns new model name."""
+    cur = current_model()
+
+    if cur == "small":
+        new_model = "large"
+    elif cur == "large":
+        new_model = "canary"
+    else:  # canary → back to small
+        new_model = "small"
+
+    if new_model == "canary":
+        # Stop nerd-dictation, start canary
+        _systemctl("stop", SERVICE)
+        _systemctl("start", CANARY_SERVICE)
+    else:
+        # Stop canary, update nerd-dictation model, start it
+        _systemctl("stop", CANARY_SERVICE)
+
+        if not SERVICE_FILE.exists():
+            return new_model
+        content = SERVICE_FILE.read_text()
+        if new_model == "large":
+            content = content.replace("vosk-model-small-es", "vosk-model-es-0.42")
+        else:
+            content = content.replace("vosk-model-es-0.42", "vosk-model-small-es")
+        SERVICE_FILE.write_text(content)
+        _systemctl("daemon-reload")
+        _systemctl("start", SERVICE)
+
+    return new_model
 
 
 # ─── Definición de items ─────────────────────────────────
@@ -305,9 +360,9 @@ ITEMS = [
     {
         "type": "cycle",
         "key": "model",
-        "label": "Modelo: {value}",
-        "desc": "Small: rápido ~50MB · Large: preciso ~2GB.",
-        "values": ["small", "large"],
+        "label": "Motor: {value}",
+        "desc": "Small (VOSK) · Large (VOSK) · Canary (Whisper GGUF).",
+        "values": ["small", "large", "canary"],
         "get": current_model,
         "apply": lambda v: switch_model(),
         "_on": None,
@@ -352,14 +407,20 @@ def draw(stdscr, idx, items):
     put(top, left + 2, " ndctl — Panel de control ", curses.A_BOLD)
 
     # Status line
-    svc_on = service_active()
-    dict_on = daemon_running() and not is_suspended()
-    parts = ["servicio " + ("activo" if svc_on else "inactivo")]
-    if svc_on:
-        parts.append("escuchando" if dict_on else "en pausa")
     model = current_model()
-    parts.append(f"modelo: {model}")
-    put(top + 2, left + 3, "  ".join(parts), curses.A_DIM)
+    if model == "canary":
+        canary_on = subprocess.run(
+            ["systemctl", "--user", "is-active", CANARY_SERVICE],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        parts = ["Canary " + ("✓" if canary_on == "active" else "✗")]
+    else:
+        svc_on = service_active()
+        dict_on = daemon_running() and not is_suspended()
+        parts = [f"VOSK {model}" + (" ✓" if svc_on else " ✗")]
+        if svc_on:
+            parts.append("escuchando" if dict_on else "pausa")
+    put(top + 2, left + 3, "  ·  ".join(parts), curses.A_DIM)
 
     # Items
     oy = top + 4
