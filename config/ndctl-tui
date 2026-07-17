@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""
+ndctl-tui — Panel de control interactivo para nerd-dictation.
+
+TUI estilo Gentle AI: box con esquinas redondeadas, cursor ">",
+checkboxes [x]/[ ], descripciones multilínea, navegación con flechas,
+Space para toggle, Enter para aplicar, Esc para cancelar.
+"""
+
+import curses
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+SERVICE = "nerd-dictation.service"
+COOKIE = "/tmp/nerd-dictation-cookie"
+STATE_FILE = "/tmp/nerd-dictation-state"
+
+
+def service_active() -> bool:
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "is-active", SERVICE],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return out == "active"
+    except Exception:
+        return False
+
+
+def daemon_running() -> bool:
+    if not os.path.exists(COOKIE):
+        return False
+    try:
+        with open(COOKIE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def is_suspended() -> bool:
+    if not os.path.exists(STATE_FILE):
+        return False
+    return Path(STATE_FILE).read_text().strip() == "suspended"
+
+
+def service_enable() -> bool:
+    try:
+        subprocess.run(["systemctl", "--user", "enable", SERVICE],
+                       check=False, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def start_service():
+    subprocess.run(["systemctl", "--user", "start", SERVICE])
+
+
+def stop_service():
+    subprocess.run(["systemctl", "--user", "stop", SERVICE])
+
+
+def suspend_dictation():
+    nerd = os.path.expanduser(
+        "~/Documentos/proyectos/transcripcion/nerd-dictation/nerd-dictation"
+    )
+    if not os.path.exists(nerd):
+        nerd = os.path.expanduser("~/nerd-dictation/nerd-dictation")
+    subprocess.run([nerd, "suspend", "--cookie", COOKIE])
+    Path(STATE_FILE).write_text("suspended")
+
+
+def resume_dictation():
+    nerd = os.path.expanduser(
+        "~/Documentos/proyectos/transcripcion/nerd-dictation/nerd-dictation"
+    )
+    if not os.path.exists(nerd):
+        nerd = os.path.expanduser("~/nerd-dictation/nerd-dictation")
+    subprocess.run([nerd, "resume", "--cookie", COOKIE])
+    Path(STATE_FILE).write_text("listening")
+
+
+# ── Opciones del menú ─────────────────────────────────────
+# Cada item: (key, label, descripción multilínea, get_state, apply_state)
+OPTIONS = [
+    {
+        "key": "svc",
+        "label": "Servicio",
+        "desc": ["Inicia o detiene el daemon de nerd-dictation.",
+                 "Cuando está activo, escucha permanentemente el micrófono."],
+        "get": service_active,
+        "apply": lambda on: start_service() if on else stop_service(),
+    },
+    {
+        "key": "dict",
+        "label": "Dictado activo",
+        "desc": ["Pausa o reanuda la captura de voz sin detener el daemon.",
+                 "Útil para tomar un descanso sin cerrar el servicio."],
+        "get": lambda: daemon_running() and not is_suspended(),
+        "apply": lambda on: resume_dictation() if on else suspend_dictation(),
+    },
+]
+
+
+# ── Render ────────────────────────────────────────────────
+def draw(stdscr, idx, items):
+    stdscr.erase()
+    rows, cols = stdscr.getmaxyx()
+    h = min(rows, 22)
+    w = min(cols, 78)
+    top = max(0, (rows - h) // 2)
+    left = max(0, (cols - w) // 2)
+
+    # Esquinas y bordes redondeados
+    tl, tr = "╭", "╮"
+    bl, br = "╰", "╯"
+    hbar, vbar = "─", "│"
+
+    def put(y, x, ch, attr=0):
+        if 0 <= y < rows and 0 <= x < cols:
+            try:
+                stdscr.addstr(y, x, ch, attr)
+            except curses.error:
+                pass
+
+    # Marco
+    put(top, left, tl)
+    put(top, left + w - 1, tr)
+    put(top + h - 1, left, bl)
+    put(top + h - 1, left + w - 1, br)
+    for x in range(left + 1, left + w - 1):
+        put(top, x, hbar)
+        put(top + h - 1, x, hbar)
+    for y in range(top + 1, top + h - 1):
+        put(y, left, vbar)
+        put(y, left + w - 1, vbar)
+
+    # Título
+    title = " ndctl — Panel de control "
+    put(top, left + 2, title, curses.A_BOLD)
+
+    # Estado actual
+    svc = service_active()
+    dict_on = daemon_running() and not is_suspended()
+    status_line = "Estado: servicio " + ("activo" if svc else "inactivo")
+    if svc:
+        status_line += ", " + (
+            "escuchando" if dict_on else "dictado en pausa"
+        )
+    put(top + 2, left + 3, status_line, curses.A_DIM)
+
+    # Opciones
+    oy = top + 4
+    for i, opt in enumerate(items):
+        checked = opt["get"]()
+        opt["_on"] = checked
+        box = "[x]" if checked else "[ ]"
+        pointer = ">" if i == idx else " "
+        line = f" {pointer} {box} {opt['label']}"
+        attr = curses.A_REVERSE if i == idx else 0
+        put(oy, left + 2, line, attr)
+        oy += 1
+        # Descripción multilínea
+        for desc in opt["desc"]:
+            put(oy, left + 8, "  " + desc, curses.A_DIM)
+            oy += 1
+        oy += 1  # Separador
+
+    # Footer con hints
+    hint = " espacio: toggle · enter: aplicar · esc: cancelar "
+    put(top + h - 1, left + 2, hint, curses.A_DIM)
+
+    stdscr.refresh()
+
+
+def apply_changes(items):
+    """Aplica los cambios de cada item según el estado actual."""
+    for opt in items:
+        on_now = opt["get"]()
+        wanted = opt.get("_on", on_now)
+        if wanted != on_now:
+            opt["apply"](wanted)
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+    idx = 0
+    items = list(OPTIONS)
+
+    while True:
+        draw(stdscr, idx, items)
+        key = stdscr.getch()
+
+        if key in (27,):  # ESC
+            return
+        if key in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(items)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(items)
+        elif key in (ord(" "),):
+            opt = items[idx]
+            opt["_on"] = not opt.get("_on", opt["get"]())
+        elif key in (curses.KEY_ENTER, 10, 13):
+            apply_changes(items)
+            return
+        elif key in (ord("q"), ord("Q")):
+            return
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        sys.exit(0)

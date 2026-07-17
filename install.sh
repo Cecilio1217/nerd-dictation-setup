@@ -185,15 +185,29 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════
-#  TOGGLE SCRIPT
+#  TOGGLE SCRIPT + TUI
 # ═══════════════════════════════════════════════════════════
-section "7/8 — Instalar toggle script"
+section "7/8 — Instalar toggle script y TUI"
 
 run mkdir -p "$HOME/.local/bin"
 if [ -f "$CONFIG_DIR/nerd-dictation-toggle" ]; then
     run cp "$CONFIG_DIR/nerd-dictation-toggle" "$HOME/.local/bin/nerd-dictation-toggle"
     run chmod +x "$HOME/.local/bin/nerd-dictation-toggle"
     info "Toggle script: ~/.local/bin/nerd-dictation-toggle"
+fi
+
+# CLI (ndctl)
+if [ -f "$CONFIG_DIR/ndctl" ]; then
+    run cp "$CONFIG_DIR/ndctl" "$HOME/.local/bin/ndctl"
+    run chmod +x "$HOME/.local/bin/ndctl"
+    info "CLI: ~/.local/bin/ndctl"
+fi
+
+# TUI estilo Gentle AI (curses, sin dependencias extra)
+if [ -f "$CONFIG_DIR/ndctl-tui" ]; then
+    run cp "$CONFIG_DIR/ndctl-tui" "$HOME/.local/bin/ndctl-tui"
+    run chmod +x "$HOME/.local/bin/ndctl-tui"
+    info "TUI: ~/.local/bin/ndctl-tui (lanzala con: ndctl menu)"
 fi
 
 # PipeWire filter-chain (opcional)
