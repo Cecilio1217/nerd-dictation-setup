@@ -1,10 +1,12 @@
 From: Cecilio <ceciliomato@gmail.com>
 Date: July 2026
-Subject: Latency optimizations for real-time dictation
+Subject: Latency optimizations + space between words fix for real-time dictation
 
-Reduces latency from ~300ms to ~50ms by:
-1. Smaller block_size: 1MB → 4KB (more responsive partial results)
-2. Lower parec latency: 10ms → 5ms
+Changes:
+1. Smaller block_size: 1MB -> 4KB (more responsive partial results)
+2. Lower parec latency: 10ms -> 5ms
+3. Space between words: after a pause (final result reset), prepend a space
+   so the next utterance doesn't get joined to the previous word.
 
 diff --git a/nerd-dictation b/nerd-dictation
 --- a/nerd-dictation
@@ -30,3 +32,16 @@ diff --git a/nerd-dictation b/nerd-dictation
  
      use_timeout = timeout != 0.0
      if use_timeout:
+@@ -1039,6 +1039,12 @@ def text_from_vosk_pipe(
+         else:
+             text_curr = process_fn(" ".join(text_list + [text]))
+ 
++        # When text_prev was reset to "" after a final result (due to a pause),
++        # prepend a space so the next word doesn't get joined to the previous one.
++        # Don't add space on the very first utterance (handled_any == False).
++        if text_prev == "" and text_curr and handled_any:
++            text_curr = " " + text_curr
++
+         if text_curr != text_prev:
+             match = min(len(text_curr), len(text_prev))
+             for i in range(min(len(text_curr), len(text_prev))):
