@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-ndctl-tui — Panel de control interactivo para nerd-dictation.
+ndctl-tui — Panel de control para nerd-dictation + canary.
 
-TUI estilo Gentle AI: box redondeado, cursor ">", checkboxes [x]/[ ],
-descripciones multilínea, navegación con ↑↓, Space para toggle,
-Enter para aplicar/configurar, Esc para cancelar.
-
-Tipos de item:
-  toggle    — [x]/[ ] checkbox, Space cambia, Enter aplica
-  action    — se ejecuta al presionar Enter (no tiene checkbox)
-  cycle     — cicla entre valores al presionar Enter/Space
+Tipos de item en menú principal:
+  toggle   — [x]/[ ] checkbox, Space cambia, Enter aplica
+  action   — se ejecuta con Enter
+  submenu  — abre un submenú al presionar Enter (Modelos)
 """
 
 import curses
@@ -17,6 +13,8 @@ import os
 import subprocess
 import sys
 import shutil
+import threading
+import time
 from pathlib import Path
 
 SERVICE = "nerd-dictation.service"
@@ -24,45 +22,92 @@ CANARY_SERVICE = "stt-canary.service"
 SERVICE_FILE = Path.home() / ".config" / "systemd" / "user" / SERVICE
 COOKIE = Path("/tmp/nerd-dictation-cookie")
 STATE_FILE = Path("/tmp/nerd-dictation-state")
-NERD = (
-    Path.home() / "Documentos" / "proyectos" / "transcripcion" / "nerd-dictation" / "nerd-dictation"
-)
+NERD_DIR = Path.home() / "Documentos" / "proyectos" / "transcripcion" / "nerd-dictation"
+NERD = NERD_DIR / "nerd-dictation"
 if not NERD.exists():
     NERD = Path.home() / "nerd-dictation" / "nerd-dictation"
 
+# ─── Definición de modelos ──────────────────────────────
+MODELS = [
+    {
+        "id": "small",
+        "name": "VOSK small",
+        "desc": "Ligero y rápido · ~58MB",
+        "path": NERD_DIR / "vosk-model-small-es",
+        "check_file": NERD_DIR / "vosk-model-small-es" / "am",
+        "size": "58MB",
+        "url": "https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip",
+        "download_dir": NERD_DIR,
+        "zip_name": "vosk-model-small-es-0.42.zip",
+        "engine": "vosk",
+    },
+    {
+        "id": "large",
+        "name": "VOSK large",
+        "desc": "Mayor precisión · 2.3GB · requiere ~3GB RAM",
+        "path": NERD_DIR / "vosk-model-es-0.42",
+        "check_file": NERD_DIR / "vosk-model-es-0.42" / "am",
+        "size": "2.3GB",
+        "url": "https://alphacephei.com/vosk/models/vosk-model-es-0.42.zip",
+        "download_dir": NERD_DIR,
+        "zip_name": "vosk-model-es-0.42.zip",
+        "engine": "vosk",
+    },
+    {
+        "id": "canary",
+        "name": "Canary Whisper",
+        "desc": "Modelo GGUF 209MB · Vulkan+CPU · transcribe_cpp",
+        "path": Path.home() / ".local/share/com.pais.handy/models/canary-180m-flash-gguf",
+        "check_file": Path.home() / ".local/share/com.pais.handy/models/canary-180m-flash-gguf" / "canary-180m-flash-Q8_0.gguf",
+        "size": "209MB",
+        "url": None,  # Already present, don't auto-download
+        "engine": "canary",
+    },
+]
 
-# ─── Helpers ──────────────────────────────────────────────
-
-def _nerd_cmd(*args):
-    """Run nerd-dictation with args."""
-    subprocess.run([str(NERD), *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
+# ─── Helpers básicos ────────────────────────────────────
 
 def _systemctl(*args):
-    """Run systemctl --user."""
-    subprocess.run(["systemctl", "--user", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "--user", *args],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _nerd_cmd(*args):
+    subprocess.run([str(NERD), *args],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _model_downloaded(m: dict) -> bool:
+    """Check if a model's check_file exists."""
+    f = m.get("check_file") or m.get("path")
+    return f is not None and f.exists()
+
+
+def _model_active_id() -> str:
+    """Detect current engine: small, large, or canary."""
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "is-active", CANARY_SERVICE],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        if out == "active":
+            return "canary"
+    except Exception:
+        pass
+    if SERVICE_FILE.exists():
+        content = SERVICE_FILE.read_text()
+        if "vosk-model-es-0.42" in content:
+            return "large"
+    return "small"
 
 
 def service_active() -> bool:
-    """Check if the currently active transcription service is running."""
     try:
-        svc = CANARY_SERVICE if current_model() == "canary" else SERVICE
+        svc = CANARY_SERVICE if _model_active_id() == "canary" else SERVICE
         out = subprocess.check_output(
             ["systemctl", "--user", "is-active", svc], stderr=subprocess.DEVNULL
         ).decode().strip()
         return out == "active"
-    except Exception:
-        return False
-
-
-def service_enabled() -> bool:
-    """Check if nerd-dictation (VOSK) is enabled at login."""
-    # Only applies to VOSK, canary has its own enable/disable
-    try:
-        out = subprocess.check_output(
-            ["systemctl", "--user", "is-enabled", SERVICE], stderr=subprocess.DEVNULL
-        ).decode().strip()
-        return out == "enabled"
     except Exception:
         return False
 
@@ -79,13 +124,20 @@ def daemon_running() -> bool:
 
 
 def is_suspended() -> bool:
-    if not STATE_FILE.exists():
+    return STATE_FILE.exists() and STATE_FILE.read_text().strip() == "suspended"
+
+
+def service_enabled() -> bool:
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "is-enabled", SERVICE], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        return out == "enabled"
+    except Exception:
         return False
-    return STATE_FILE.read_text().strip() == "suspended"
 
 
 def filter_loaded() -> bool:
-    """Check if PipeWire noise-reduction virtual source exists."""
     try:
         out = subprocess.check_output(
             ["pactl", "list", "short", "modules"], stderr=subprocess.DEVNULL
@@ -96,9 +148,9 @@ def filter_loaded() -> bool:
 
 
 def has_config_flag() -> bool:
-    """Check if the service file has --config flag (command processing enabled)."""
+    """Check if the service file has --config flag (command processing)."""
     if not SERVICE_FILE.exists():
-        return True  # assume enabled by default
+        return True
     content = SERVICE_FILE.read_text()
     return "--config" in content and not any(
         line.strip().startswith("#") and "--config" in line
@@ -106,37 +158,9 @@ def has_config_flag() -> bool:
     )
 
 
-# ─── Actions ──────────────────────────────────────────────
-
-def start_service():
-    """Start the active transcription service."""
-    if current_model() == "canary":
-        _systemctl("start", CANARY_SERVICE)
-    else:
-        _systemctl("start", SERVICE)
-
-
-def stop_service():
-    """Stop the active transcription service."""
-    _systemctl("stop", SERVICE)
-    _systemctl("stop", CANARY_SERVICE)
-
-
-def restart_service():
-    """Restart the active transcription service."""
-    stop_service()
-    import time
-    time.sleep(0.5)
-    start_service()
-    time.sleep(0.5)
-
-
-def enable_service():
-    _systemctl("enable", SERVICE)
-
-
-def disable_service():
-    _systemctl("disable", SERVICE)
+def resume_dictation():
+    _nerd_cmd("resume", "--cookie", str(COOKIE))
+    STATE_FILE.write_text("listening")
 
 
 def suspend_dictation():
@@ -144,282 +168,228 @@ def suspend_dictation():
     STATE_FILE.write_text("suspended")
 
 
-def resume_dictation():
-    _nerd_cmd("resume", "--cookie", str(COOKIE))
-    STATE_FILE.write_text("listening")
-
-
-def toggle_transcribe_only(on: bool) -> None:
-    """Toggle solo-transcribir mode by commenting/uncommenting --config in the service file.
-
-    When on: comment out the --config line so the plugin doesn't process commands.
-    When off: uncomment it so voice commands work again.
-    """
+def toggle_transcribe_only(on: bool):
+    """Toggle --config flag in service file."""
     if not SERVICE_FILE.exists():
         return
-
     content = SERVICE_FILE.read_text()
     lines = content.splitlines()
     new_lines = []
     for line in lines:
         if "--config" in line:
             if on:
-                # Comment it out if not already
                 stripped = line.lstrip()
                 if not stripped.startswith("#"):
                     new_lines.append("#" + line)
                     continue
             else:
-                # Uncomment it
                 new_lines.append(line.lstrip("#"))
                 continue
         new_lines.append(line)
-
     SERVICE_FILE.write_text("\n".join(new_lines) + "\n")
     _systemctl("daemon-reload")
     restart_service()
 
 
-def toggle_filter(on: bool) -> None:
-    """Toggle PipeWire noise-reduction filter-chain."""
+def toggle_filter(on: bool):
+    """Toggle PipeWire filter-chain."""
     filter_conf = Path.home() / ".config" / "pipewire" / "filter-chain.conf.d" / "noise-reduction-source.conf"
     if not filter_conf.exists():
         return
-
     if on:
-        # Restart PipeWire so it picks up the filter config
         _systemctl("restart", "pipewire")
     else:
-        # Rename config so PipeWire doesn't load it, then restart
         backup = filter_conf.with_name("noise-reduction-source.conf.disabled")
         if not backup.exists():
             shutil.move(str(filter_conf), str(backup))
         _systemctl("restart", "pipewire")
 
 
-def toggle_auto_silence(on: bool) -> None:
-    """Toggle auto-silence mode by adjusting --idle-time / --delay-exit.
-
-    When on: use longer idle-time (0.5) so the daemon is less reactive.
-    When off: use fast idle-time (0.05) for responsive dictation.
-    """
+def toggle_auto_silence(on: bool):
+    """Toggle idle-time in service file."""
     if not SERVICE_FILE.exists():
         return
-
     content = SERVICE_FILE.read_text()
     if on:
         content = content.replace("--idle-time 0.05", "--idle-time 0.5")
     else:
         content = content.replace("--idle-time 0.5", "--idle-time 0.05")
-
     SERVICE_FILE.write_text(content)
     _systemctl("daemon-reload")
     restart_service()
 
 
-def switch_model() -> str:
-    """Switch between small and large VOSK model. Returns the new model name."""
-    if not SERVICE_FILE.exists():
-        return "small"
+# ─── Acciones ───────────────────────────────────────────
 
-    content = SERVICE_FILE.read_text()
-    if "vosk-model-small-es" in content and "vosk-model-es-0.42" not in content:
-        # Switch to large
-        content = content.replace("vosk-model-small-es", "vosk-model-es-0.42")
-        new_model = "large"
+def start_service():
+    if _model_active_id() == "canary":
+        _systemctl("start", CANARY_SERVICE)
     else:
-        # Switch to small
-        content = content.replace("vosk-model-es-0.42", "vosk-model-small-es")
-        new_model = "small"
-
-    SERVICE_FILE.write_text(content)
-    _systemctl("daemon-reload")
-    restart_service()
-    return new_model
+        _systemctl("start", SERVICE)
 
 
-def current_model() -> str:
-    """Detect current transcription engine: small, large, or canary."""
-    if not SERVICE_FILE.exists():
-        return "small"
-    try:
-        out = subprocess.check_output(
-            ["systemctl", "--user", "is-active", CANARY_SERVICE],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        if out == "active":
-            return "canary"
-    except Exception:
-        pass
-    content = SERVICE_FILE.read_text()
-    if "vosk-model-es-0.42" in content:
-        return "large"
-    return "small"
+def stop_service():
+    _systemctl("stop", SERVICE)
+    _systemctl("stop", CANARY_SERVICE)
 
 
-def switch_model() -> str:
-    """Switch between small, large, and canary. Returns new model name."""
-    cur = current_model()
+def restart_service():
+    stop_service()
+    time.sleep(0.5)
+    start_service()
+    time.sleep(0.5)
 
-    if cur == "small":
-        new_model = "large"
-    elif cur == "large":
-        new_model = "canary"
-    else:  # canary → back to small
-        new_model = "small"
 
-    if new_model == "canary":
-        # Stop nerd-dictation, start canary
+def switch_to_model(model_id: str) -> bool:
+    """Switch to a model. Returns True on success."""
+    cur = _model_active_id()
+    if model_id == cur:
+        return True
+    if model_id == "canary":
         _systemctl("stop", SERVICE)
         _systemctl("start", CANARY_SERVICE)
     else:
-        # Stop canary, update nerd-dictation model, start it
         _systemctl("stop", CANARY_SERVICE)
-
-        if not SERVICE_FILE.exists():
-            return new_model
-        content = SERVICE_FILE.read_text()
-        if new_model == "large":
-            content = content.replace("vosk-model-small-es", "vosk-model-es-0.42")
-        else:
-            content = content.replace("vosk-model-es-0.42", "vosk-model-small-es")
-        SERVICE_FILE.write_text(content)
-        _systemctl("daemon-reload")
+        if SERVICE_FILE.exists():
+            content = SERVICE_FILE.read_text()
+            if model_id == "large":
+                content = content.replace("vosk-model-small-es", "vosk-model-es-0.42")
+            else:
+                content = content.replace("vosk-model-es-0.42", "vosk-model-small-es")
+            SERVICE_FILE.write_text(content)
+            _systemctl("daemon-reload")
         _systemctl("start", SERVICE)
+    time.sleep(0.5)
+    return True
 
-    return new_model
+
+def download_model(m: dict, progress_callback=None) -> bool:
+    """Download and extract a model. Shows progress via callback."""
+    url = m.get("url")
+    dest = m.get("download_dir")
+    zip_name = m.get("zip_name")
+    if not url or not dest or not zip_name:
+        return False
+    dest.mkdir(parents=True, exist_ok=True)
+    zip_path = dest / zip_name
+    try:
+        if progress_callback:
+            progress_callback(f"Descargando {m['name']}...")
+        r = subprocess.run(
+            ["wget", "-O", str(zip_path), url],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if r.returncode != 0:
+            return False
+        if progress_callback:
+            progress_callback(f"Extrayendo {m['name']}...")
+        r = subprocess.run(
+            ["unzip", "-o", str(zip_path), "-d", str(dest)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        zip_path.unlink(missing_ok=True)
+        if r.returncode != 0:
+            return False
+        # Handle subdirectory (zip extracts to vosk-model-*.*.*/)
+        for p in dest.iterdir():
+            if p.is_dir() and p.name.startswith("vosk-model-") and p != m["path"]:
+                if p.name.endswith(zip_name.replace(".zip", "")):
+                    # Move contents to expected path
+                    if not m["path"].exists():
+                        p.rename(m["path"])
+                    else:
+                        shutil.copytree(p, m["path"], dirs_exist_ok=True)
+                        shutil.rmtree(p)
+                break
+        return True
+    except Exception:
+        return False
 
 
-# ─── Definición de items ─────────────────────────────────
+# ─── Render helpers ─────────────────────────────────────
+
+def _box(stdscr, top, left, h, w, title, footer):
+    """Draw rounded box with title and footer."""
+    tl, tr = "╭", "╮"
+    bl, br = "╰", "╯"
+    hb, vb = "─", "│"
+
+    def put(y, x, ch, attr=0):
+        try:
+            if 0 <= y < stdscr.getmaxyx()[0] and 0 <= x < stdscr.getmaxyx()[1]:
+                stdscr.addstr(y, x, ch, attr)
+        except curses.error:
+            pass
+
+    put(top, left, tl, curses.A_BOLD)
+    put(top, left + w - 1, tr, curses.A_BOLD)
+    put(top + h - 1, left, bl, curses.A_BOLD)
+    put(top + h - 1, left + w - 1, br, curses.A_BOLD)
+    for x in range(left + 1, left + w - 1):
+        put(top, x, hb)
+        put(top + h - 1, x, hb)
+    for y in range(top + 1, top + h - 1):
+        put(y, left, vb)
+        put(y, left + w - 1, vb)
+    put(top, left + 2, title, curses.A_BOLD)
+    put(top + h - 1, left + 2, footer, curses.A_DIM)
+    return put
+
+
+# ─── Pantalla principal ─────────────────────────────────
 
 ITEMS = [
-    # ── Servicio ────────────────────────────────────────
-    {
-        "type": "toggle",
-        "key": "svc",
-        "label": "Servicio activo",
-        "desc": "Inicia/detiene el daemon de dictado por voz.",
-        "get": service_active,
-        "apply": lambda on: start_service() if on else stop_service(),
-        "_on": service_active(),
-    },
-    {
-        "type": "toggle",
-        "key": "autostart",
-        "label": "Inicio automático",
-        "desc": "Arranca nerd-dictation al iniciar sesión.",
-        "get": service_enabled,
-        "apply": lambda on: enable_service() if on else disable_service(),
-        "_on": service_enabled(),
-    },
-    {
-        "type": "action",
-        "key": "restart",
-        "label": "Reiniciar servicio",
-        "desc": "Detiene y vuelve a iniciar el daemon.",
-        "action": restart_service,
-    },
-    # ── Dictado ─────────────────────────────────────────
-    {
-        "type": "toggle",
-        "key": "dict",
-        "label": "Dictado activo",
-        "desc": "Pausa/reanuda captura sin detener el servicio.",
-        "get": lambda: daemon_running() and not is_suspended(),
-        "apply": lambda on: resume_dictation() if on else suspend_dictation(),
-        "_on": daemon_running() and not is_suspended(),
-    },
-    {
-        "type": "toggle",
-        "key": "transcribe",
-        "label": "Solo transcribir",
-        "desc": "Texto crudo sin procesar comandos por voz.",
-        "get": lambda: not has_config_flag(),
-        "apply": toggle_transcribe_only,
-        "_on": not has_config_flag(),
-    },
-    {
-        "type": "toggle",
-        "key": "filter",
-        "label": "Filtro de ruido",
-        "desc": "PipeWire filter-chain para reducir ruido ambiente.",
-        "get": filter_loaded,
-        "apply": toggle_filter,
-        "_on": filter_loaded(),
-    },
-    {
-        "type": "toggle",
-        "key": "silence",
-        "label": "Silencio automático",
-        "desc": "Modo relajado: menos reactivo a pausas breves.",
-        "get": lambda: False,
-        "apply": toggle_auto_silence,
-        "_on": False,
-    },
-    # ── Modelo ───────────────────────────────────────────
-    {
-        "type": "cycle",
-        "key": "model",
-        "label": "Motor: {value}",
-        "desc": "Small (VOSK) · Large (VOSK) · Canary (Whisper GGUF).",
-        "values": ["small", "large", "canary"],
-        "get": current_model,
-        "apply": lambda v: switch_model(),
-        "_on": None,
-    },
+    {"type": "toggle",   "key": "svc",     "label": "Servicio activo",
+     "desc": "Inicia/detiene el daemon de dictado por voz.",
+     "get": service_active,
+     "apply": lambda on: start_service() if on else stop_service()},
+    {"type": "toggle",   "key": "autostart","label": "Inicio automático",
+     "desc": "Arranca nerd-dictation al iniciar sesión.",
+     "get": service_enabled,
+     "apply": lambda on: _systemctl("enable", SERVICE) if on else _systemctl("disable", SERVICE)},
+    {"type": "action",   "key": "restart",  "label": "Reiniciar servicio",
+     "desc": "Detiene y vuelve a iniciar el daemon.", "action": restart_service},
+    {"type": "toggle",   "key": "dict",     "label": "Dictado activo",
+     "desc": "Pausa/reanuda captura sin detener el servicio.",
+     "get": lambda: daemon_running() and not is_suspended(),
+     "apply": lambda on: resume_dictation() if on else suspend_dictation()},
+    {"type": "toggle",   "key": "transcribe","label": "Solo transcribir",
+     "desc": "Texto crudo sin procesar comandos por voz.",
+     "get": lambda: not has_config_flag(),
+     "apply": toggle_transcribe_only},
+    {"type": "toggle",   "key": "filter",   "label": "Filtro de ruido",
+     "desc": "PipeWire filter-chain para reducir ruido ambiente.",
+     "get": filter_loaded,
+     "apply": toggle_filter},
+    {"type": "toggle",   "key": "silence",  "label": "Silencio automático",
+     "desc": "Modo relajado: menos reactivo a pausas breves.",
+     "get": lambda: False,
+     "apply": toggle_auto_silence},
+    {"type": "submenu",  "key": "models",   "label": "Modelos",
+     "desc": "Elegir motor (VOSK/Canary) y descargar si falta."},
 ]
 
 
-# ─── Render ──────────────────────────────────────────────
-
-def draw(stdscr, idx, items):
+def draw_main(stdscr, idx, items):
     stdscr.erase()
     rows, cols = stdscr.getmaxyx()
-    h = min(rows, 22)
-    w = min(cols, 78)
+    h, w = min(rows, 22), min(cols, 78)
     top = max(0, (rows - h) // 2)
     left = max(0, (cols - w) // 2)
+    put = _box(stdscr, top, left, h, w,
+               " ndctl — Panel de control ",
+               " espacio: toggle · enter: aplicar · esc: cancelar ")
 
-    tl, tr = "╭", "╮"
-    bl, br = "╰", "╯"
-    hbar, vbar = "─", "│"
-
-    def put(y, x, ch, attr=0):
-        if 0 <= y < rows and 0 <= x < cols:
-            try:
-                stdscr.addstr(y, x, ch, attr)
-            except curses.error:
-                pass
-
-    # Frame
-    put(top, left, tl)
-    put(top, left + w - 1, tr)
-    put(top + h - 1, left, bl)
-    put(top + h - 1, left + w - 1, br)
-    for x in range(left + 1, left + w - 1):
-        put(top, x, hbar)
-        put(top + h - 1, x, hbar)
-    for y in range(top + 1, top + h - 1):
-        put(y, left, vbar)
-        put(y, left + w - 1, vbar)
-
-    # Title
-    put(top, left + 2, " ndctl — Panel de control ", curses.A_BOLD)
-
-    # Status line
-    model = current_model()
-    if model == "canary":
-        canary_on = subprocess.run(
-            ["systemctl", "--user", "is-active", CANARY_SERVICE],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        parts = ["Canary " + ("✓" if canary_on == "active" else "✗")]
+    # Status
+    mid = _model_active_id()
+    if mid == "canary":
+        parts = ["Canary " + ("✓" if service_active() else "✗")]
     else:
-        svc_on = service_active()
-        dict_on = daemon_running() and not is_suspended()
-        parts = [f"VOSK {model}" + (" ✓" if svc_on else " ✗")]
-        if svc_on:
-            parts.append("escuchando" if dict_on else "pausa")
+        svc = service_active()
+        dct = daemon_running() and not is_suspended()
+        parts = [f"VOSK {mid}" + (" ✓" if svc else " ✗")]
+        if svc:
+            parts.append("escuchando" if dct else "pausa")
     put(top + 2, left + 3, "  ·  ".join(parts), curses.A_DIM)
 
     # Items
@@ -427,101 +397,151 @@ def draw(stdscr, idx, items):
     for i, opt in enumerate(items):
         if oy >= top + h - 2:
             break
-
-        t = opt["type"]
         pointer = ">" if i == idx else " "
-
+        t = opt["type"]
         if t == "toggle":
             checked = opt.get("_on", opt["get"]())
             box = "[x]" if checked else "[ ]"
             line = f" {pointer} {box} {opt['label']}"
-        elif t == "action":
+        elif t == "submenu":
+            line = f" {pointer}  → {opt['label']}"
+        else:
             line = f" {pointer}   {opt['label']}"
-        elif t == "cycle":
-            val = opt["get"]()
-            label = opt["label"].format(value=val)
-            line = f" {pointer}   {label}"
-
         attr = curses.A_REVERSE if i == idx else 0
         put(oy, left + 2, line, attr)
         oy += 1
-
-        # One-line description
-        put(oy, left + 8, "  " + opt["desc"], curses.A_DIM)
+        put(oy, left + 8, "  " + opt.get("desc", ""), curses.A_DIM)
         oy += 1
-
-    # Footer
-    hint = " espacio: toggle · enter: aplicar · esc: cancelar "
-    put(top + h - 1, left + 2, hint, curses.A_DIM)
 
     stdscr.refresh()
 
 
+def main_loop(stdscr, items):
+    idx = 0
+    for opt in items:
+        if opt["type"] == "toggle":
+            opt["_on"] = opt["get"]() if callable(opt.get("get")) else opt.get("_on", True)
+
+    while True:
+        draw_main(stdscr, idx, items)
+        key = stdscr.getch()
+        if key in (27, ord("q")):
+            return
+        elif key in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(items)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(items)
+        elif key in (ord(" "),):
+            opt = items[idx]
+            if opt["type"] == "toggle":
+                opt["_on"] = not opt.get("_on", True)
+            elif opt["type"] == "action":
+                opt["action"]()
+        elif key in (curses.KEY_ENTER, 10, 13):
+            opt = items[idx]
+            if opt["type"] == "action":
+                opt["action"]()
+            elif opt["type"] == "toggle":
+                apply_toggles(items)
+                return
+            elif opt["type"] == "submenu":
+                model_menu(stdscr)
+                model_menu_item = next((o for o in items if o["type"] == "submenu"), None)
+                if model_menu_item:
+                    model_menu_item["label"] = f"Motor: {_model_active_id()}"
+
+
 def apply_toggles(items):
-    """Apply toggle state changes."""
     for opt in items:
         if opt["type"] != "toggle":
             continue
-        on_now = opt["get"]()
+        on_now = callable(opt["get"]) and opt["get"]()
         wanted = opt.get("_on", on_now)
-        if wanted != on_now:
+        if callable(opt.get("apply")) and wanted != on_now:
             opt["apply"](wanted)
+
+
+# ─── Submenú de modelos ─────────────────────────────────
+
+def draw_model_menu(stdscr, idx, models):
+    stdscr.erase()
+    rows, cols = stdscr.getmaxyx()
+    h, w = min(rows, 16), min(cols, 74)
+    top = max(0, (rows - h) // 2)
+    left = max(0, (cols - w) // 2)
+    put = _box(stdscr, top, left, h, w,
+               " ndctl — Seleccionar motor ",
+               " ↑↓ navegar · enter/espacio: activar · esc: volver ")
+
+    cur_id = _model_active_id()
+    oy = top + 2
+    for i, m in enumerate(models):
+        if oy >= top + h - 2:
+            break
+        downloaded = _model_downloaded(m)
+        active = m["id"] == cur_id
+        radio = "◉" if active else "○"
+        status = " ✓" if downloaded else " ✗"
+        pointer = ">" if i == idx else " "
+        line = f" {pointer} {radio} {m['name']}{status}  {m['size']}"
+        attr = curses.A_REVERSE if i == idx else 0
+        put(oy, left + 2, line, attr)
+        oy += 1
+        desc = m["desc"]
+        if not downloaded:
+            desc += "  [Pulsa Enter para descargar]"
+        put(oy, left + 6, " " + desc, curses.A_DIM)
+        oy += 1
+
+    stdscr.refresh()
+
+
+def model_menu(stdscr):
+    idx = 0
+    while True:
+        draw_model_menu(stdscr, idx, MODELS)
+        key = stdscr.getch()
+
+        if key in (27, ord("q")):
+            return
+
+        elif key in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(MODELS)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(MODELS)
+
+        elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+            m = MODELS[idx]
+            active_id = _model_active_id()
+            if m["id"] == active_id:
+                return  # Already active, just leave
+            if not _model_downloaded(m):
+                if m.get("url"):
+                    # Download in a sub-screen
+                    stdscr.erase()
+                    rows, cols = stdscr.getmaxyx()
+                    status_text = f"Descargando {m['name']}..."
+                    stdscr.addstr(rows // 2, (cols - len(status_text)) // 2, status_text)
+                    stdscr.refresh()
+                    ok = download_model(m)
+                    if not ok:
+                        status_text = f"Error descargando {m['name']}"
+                        stdscr.addstr(rows // 2 + 1, (cols - len(status_text)) // 2, status_text, curses.A_DIM)
+                        stdscr.refresh()
+                        time.sleep(1.5)
+                        continue
+                else:
+                    continue
+            # Switch to model
+            switch_to_model(m["id"])
+            return
 
 
 def main(stdscr):
     curses.curs_set(0)
     curses.use_default_colors()
-    stdscr.nodelay(False)
-    idx = 0
     items = list(ITEMS)
-
-    # Sync initial state
-    for opt in items:
-        if opt["type"] == "toggle":
-            opt["_on"] = opt["get"]()
-
-    while True:
-        draw(stdscr, idx, items)
-        key = stdscr.getch()
-
-        if key in (27,):  # ESC
-            return
-
-        elif key in (curses.KEY_UP, ord("k")):
-            idx = (idx - 1) % len(items)
-
-        elif key in (curses.KEY_DOWN, ord("j")):
-            idx = (idx + 1) % len(items)
-
-        elif key in (ord(" "),):
-            opt = items[idx]
-            if opt["type"] == "toggle":
-                opt["_on"] = not opt.get("_on", opt["get"]())
-            elif opt["type"] == "action":
-                # Space also triggers an action
-                opt["action"]()
-
-        elif key in (curses.KEY_ENTER, 10, 13):
-            opt = items[idx]
-            if opt["type"] == "action":
-                opt["action"]()
-                # Stay in menu after action
-            elif opt["type"] == "toggle":
-                apply_toggles(items)
-                return
-            elif opt["type"] == "cycle":
-                val = opt["get"]()
-                new_val = opt["values"][0]
-                try:
-                    cur_idx = opt["values"].index(str(val))
-                    new_val = opt["values"][(cur_idx + 1) % len(opt["values"])]
-                except (ValueError, TypeError):
-                    pass
-                opt["apply"](new_val)
-                # Stay in menu after model change
-
-        elif key in (ord("q"), ord("Q")):
-            return
+    main_loop(stdscr, items)
 
 
 if __name__ == "__main__":

@@ -197,6 +197,7 @@ cmd_help() {
     echo ""
     echo "Interfaz:"
     echo "  menu                 Panel TUI (↑↓·Espacio·Enter·Esc)"
+    echo "                       Submenú modelos: seleccionar y descargar"
     echo "  logs [-f]            Ver logs del servicio"
     echo "  help                 Esta ayuda"
 }
