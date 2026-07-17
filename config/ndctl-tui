@@ -28,6 +28,7 @@ if not NERD.exists():
     NERD = Path.home() / "nerd-dictation" / "nerd-dictation"
 
 # ─── Definición de modelos ──────────────────────────────
+VENC = Path.home() / ".local/share/asistente-voz/venv-stt"
 MODELS = [
     {
         "id": "small",
@@ -40,6 +41,7 @@ MODELS = [
         "download_dir": NERD_DIR,
         "zip_name": "vosk-model-small-es-0.42.zip",
         "engine": "vosk",
+        "pip_pkg": None,  # No pip dependency for VOSK
     },
     {
         "id": "large",
@@ -52,16 +54,21 @@ MODELS = [
         "download_dir": NERD_DIR,
         "zip_name": "vosk-model-es-0.42.zip",
         "engine": "vosk",
+        "pip_pkg": None,
     },
     {
         "id": "canary",
         "name": "Canary Whisper",
-        "desc": "Modelo GGUF 209MB · Vulkan+CPU · transcribe_cpp",
+        "desc": "GGUF 209MB · Vulkan+CPU · transcribe_cpp",
         "path": Path.home() / ".local/share/com.pais.handy/models/canary-180m-flash-gguf",
         "check_file": Path.home() / ".local/share/com.pais.handy/models/canary-180m-flash-gguf" / "canary-180m-flash-Q8_0.gguf",
         "size": "209MB",
-        "url": None,  # Already present, don't auto-download
+        "url": "https://huggingface.co/handy-ai/Canary-180M-flash-gguf/resolve/main/canary-180m-flash-Q8_0.gguf",
+        "download_dir": Path.home() / ".local/share/com.pais.handy/models/canary-180m-flash-gguf",
+        "zip_name": None,  # It's a single file, not a zip
         "engine": "canary",
+        "pip_pkg": "transcribe-cpp",
+        "pip_import": "transcribe_cpp",
     },
 ]
 
@@ -264,17 +271,20 @@ def switch_to_model(model_id: str) -> bool:
 
 
 def download_model(m: dict, progress_callback=None) -> bool:
-    """Download and extract a model. Shows progress via callback."""
+    """Download and extract a model (VOSK zip or Canary GGUF)."""
     url = m.get("url")
     dest = m.get("download_dir")
-    zip_name = m.get("zip_name")
-    if not url or not dest or not zip_name:
+    if not url or not dest:
         return False
     dest.mkdir(parents=True, exist_ok=True)
-    zip_path = dest / zip_name
-    try:
-        if progress_callback:
-            progress_callback(f"Descargando {m['name']}...")
+
+    if progress_callback:
+        progress_callback(f"Descargando {m['name']}...")
+
+    zip_name = m.get("zip_name")
+    if zip_name:
+        # ZIP-based model (VOSK)
+        zip_path = dest / zip_name
         r = subprocess.run(
             ["wget", "-O", str(zip_path), url],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -291,19 +301,99 @@ def download_model(m: dict, progress_callback=None) -> bool:
         if r.returncode != 0:
             return False
         # Handle subdirectory (zip extracts to vosk-model-*.*.*/)
-        for p in dest.iterdir():
+        for p in sorted(dest.iterdir()):
             if p.is_dir() and p.name.startswith("vosk-model-") and p != m["path"]:
-                if p.name.endswith(zip_name.replace(".zip", "")):
-                    # Move contents to expected path
-                    if not m["path"].exists():
-                        p.rename(m["path"])
-                    else:
-                        shutil.copytree(p, m["path"], dirs_exist_ok=True)
-                        shutil.rmtree(p)
+                if m["path"].exists():
+                    shutil.rmtree(m["path"])
+                p.rename(m["path"])
                 break
         return True
-    except Exception:
-        return False
+    else:
+        # Single-file model (Canary GGUF)
+        filename = m["path"].name if m["path"].suffix else m["check_file"].name
+        target = dest / filename
+        r = subprocess.run(
+            ["wget", "-O", str(target), url],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+
+
+def _check_pip(pkg_name: str, import_name: str = None) -> bool:
+    """Check if a pip package can be imported (system or venv-stt)."""
+    import_name = import_name or pkg_name.replace("-", "_")
+    # Try current Python first
+    try:
+        __import__(import_name)
+        return True
+    except ImportError:
+        pass
+    # Try the venv-stt Python
+    venv_python = VENC / "bin" / "python3"
+    if venv_python.exists():
+        r = subprocess.run(
+            [str(venv_python), "-c", f"import {import_name}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+    return False
+
+
+def _install_pip(pkg: str) -> bool:
+    """Install a pip package, trying venv-stt first, then system."""
+    # Try venv-stt pip first
+    venv_pip = VENC / "bin" / "pip"
+    if venv_pip.exists():
+        r = subprocess.run(
+            [str(venv_pip), "install", "--upgrade", pkg],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if r.returncode == 0:
+            return True
+    # Fall back to system pip
+    r = subprocess.run(
+        ["pip3", "install", "--upgrade", pkg],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return r.returncode == 0
+
+
+def ensure_model(m: dict, progress_callback=None) -> bool:
+    """Ensure a model is fully ready: pip deps + model file + activation.
+
+    Returns True if the model was set up (or already ready).
+    """
+    mid = m["id"]
+    engine = m["engine"]
+
+    # 1. Check pip dependency (Canary needs transcribe-cpp)
+    pip_pkg = m.get("pip_pkg")
+    pip_import = m.get("pip_import")
+    if pip_pkg:
+        if progress_callback:
+            progress_callback(f"Verificando {pip_pkg}...")
+        if not _check_pip(pip_pkg, pip_import):
+            if progress_callback:
+                progress_callback(f"Instalando {pip_pkg}...")
+            if not _install_pip(pip_pkg):
+                if progress_callback:
+                    progress_callback(f"Error: no se pudo instalar {pip_pkg}")
+                return False
+
+    # 2. Check and download model
+    if not _model_downloaded(m):
+        if progress_callback:
+            progress_callback(f"Modelo {m['name']} no encontrado, descargando...")
+        if not download_model(m, progress_callback):
+            if progress_callback:
+                progress_callback(f"Error descargando {m['name']}")
+            return False
+
+    # 3. Activate
+    if progress_callback:
+        progress_callback(f"Activando {m['name']}...")
+    switch_to_model(mid)
+    return True
 
 
 # ─── Render helpers ─────────────────────────────────────
@@ -478,17 +568,34 @@ def draw_model_menu(stdscr, idx, models):
     for i, m in enumerate(models):
         if oy >= top + h - 2:
             break
-        downloaded = _model_downloaded(m)
+
         active = m["id"] == cur_id
         radio = "◉" if active else "○"
-        status = " ✓" if downloaded else " ✗"
         pointer = ">" if i == idx else " "
+
+        # Status icons: model file + pip deps
+        model_ok = _model_downloaded(m)
+        pip_ok = True
+        if m.get("pip_pkg"):
+            pip_ok = _check_pip(m["pip_pkg"], m.get("pip_import"))
+
+        if active:
+            status = " ✓ activo"
+        elif model_ok and pip_ok:
+            status = " ✓"
+        elif not model_ok:
+            status = " ✗ falta modelo"
+        elif not pip_ok:
+            status = " ✗ falta librería"
+
         line = f" {pointer} {radio} {m['name']}{status}  {m['size']}"
         attr = curses.A_REVERSE if i == idx else 0
         put(oy, left + 2, line, attr)
         oy += 1
         desc = m["desc"]
-        if not downloaded:
+        if not pip_ok:
+            desc += "  [pip install " + m["pip_pkg"] + "]"
+        elif not model_ok:
             desc += "  [Pulsa Enter para descargar]"
         put(oy, left + 6, " " + desc, curses.A_DIM)
         oy += 1
@@ -514,26 +621,32 @@ def model_menu(stdscr):
             m = MODELS[idx]
             active_id = _model_active_id()
             if m["id"] == active_id:
-                return  # Already active, just leave
-            if not _model_downloaded(m):
-                if m.get("url"):
-                    # Download in a sub-screen
-                    stdscr.erase()
-                    rows, cols = stdscr.getmaxyx()
-                    status_text = f"Descargando {m['name']}..."
-                    stdscr.addstr(rows // 2, (cols - len(status_text)) // 2, status_text)
-                    stdscr.refresh()
-                    ok = download_model(m)
-                    if not ok:
-                        status_text = f"Error descargando {m['name']}"
-                        stdscr.addstr(rows // 2 + 1, (cols - len(status_text)) // 2, status_text, curses.A_DIM)
-                        stdscr.refresh()
-                        time.sleep(1.5)
-                        continue
-                else:
-                    continue
-            # Switch to model
-            switch_to_model(m["id"])
+                return  # Already active
+
+            # Show progress while setting up
+            status_lines = []
+            def progress(msg):
+                status_lines.append(msg)
+                stdscr.erase()
+                rows, cols = stdscr.getmaxyx()
+                h, w = min(rows, 12), min(cols, 60)
+                top = max(0, (rows - h) // 2)
+                left = max(0, (cols - w) // 2)
+                put = _box(stdscr, top, left, h, w,
+                           " ndctl — Configurando ",
+                           " esperá un momento... ")
+                for j, s in enumerate(status_lines[-4:]):
+                    put(top + 2 + j, left + 3, s, curses.A_DIM)
+                stdscr.refresh()
+                time.sleep(0.1)
+
+            ok = ensure_model(m, progress)
+            if ok:
+                progress(f"✓ {m['name']} listo")
+                time.sleep(0.8)
+            else:
+                progress(f"✗ Error configurando {m['name']}")
+                time.sleep(2)
             return
 
 
